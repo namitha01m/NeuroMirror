@@ -1,5 +1,14 @@
+import sys
+import os
+
+print("Python executable:", sys.executable)
+print("Current working directory:", os.getcwd())
+print("sys.path:", sys.path)
+
 import torch
-from unsloth import FastLanguageModel
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, TrainingArguments
+from peft import LoraConfig, get_peft_model
+from trl import SFTTrainer
 from datasets import load_dataset
 import os
 
@@ -11,30 +20,43 @@ model_name = "google/gemma-3-7b"
 # Ensure the output directory exists
 os.makedirs(output_dir, exist_ok=True)
 
-# 1. Load the base Gemma model and prepare it for QLoRA
-# We'll use 4-bit quantization for efficiency.
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name=model_name,
-    max_seq_length=2048,
-    dtype=None,
+# 1. Load the model with BitsAndBytesConfig for 4-bit quantization
+bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16,
 )
+
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    quantization_config=bnb_config,
+    device_map="auto",
+    use_cache=False,
+)
+model.config.use_cache = False
+model.config.pretraining_tp = 1 # Recommended for Gemma
+
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "right"
 
 # 2. Configure the model for QLoRA fine-tuning
-model = FastLanguageModel.get_peft_model(
-    model,
+lora_config = LoraConfig(
     r=16,
+    lora_alpha=32,
     target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-    lora_alpha=16,
-    lora_dropout=0,
+    lora_dropout=0.05,
     bias="none",
-    use_gradient_checkpointing="unsloth",
-    random_state=3407,
-    use_rslora=False,
-    loftq_config=None,
+    task_type="CAUSAL_LM",
 )
 
+model = get_peft_model(model, lora_config)
+model.print_trainable_parameters()
+
 # 3. Load our custom dataset and format it for the model
+dataset = load_dataset("json", data_files=dataset_path, split="train")
+
 def formatting_prompts_func(examples):
     formatted_texts = []
     for messages in examples['messages']:
@@ -42,31 +64,30 @@ def formatting_prompts_func(examples):
         formatted_texts.append(formatted_text)
     return {"text": formatted_texts}
 
-dataset = load_dataset("json", data_files=dataset_path, split="train")
 dataset = dataset.map(formatting_prompts_func, batched=True, num_proc=os.cpu_count())
 
-# 4. Train the model using Hugging Face's Trainer
-from trl import SFTTrainer
-
-training_args = FastLanguageModel.get_training_arguments(
+# 4. Train the model using SFTTrainer
+training_args = TrainingArguments(
+    output_dir=output_dir,
     per_device_train_batch_size=2,
     gradient_accumulation_steps=4,
-    fp16=not torch.cuda.is_bf16_supported(),
-    bf16=torch.cuda.is_bf16_supported(),
     learning_rate=2e-4,
     num_train_epochs=3,
     max_steps=-1,
-    seed=3407,
-    output_dir=output_dir,
+    fp16=True,
+    bf16=False,
+    optim="paged_adamw_8bit",
+    logging_steps=10,
+    save_strategy="epoch",
 )
 
 trainer = SFTTrainer(
     model=model,
     tokenizer=tokenizer,
     train_dataset=dataset,
+    peft_config=lora_config,
     dataset_text_field="text",
     max_seq_length=2048,
-    dataset_num_proc=os.cpu_count(),
     packing=False,
     args=training_args,
 )
@@ -75,5 +96,4 @@ trainer = SFTTrainer(
 trainer.train()
 
 # 5. Save the fine-tuned model
-# This will save the LoRA adapter weights, which are small in size.
-model.save_pretrained_merged(output_dir, tokenizer=tokenizer)
+trainer.model.save_pretrained(output_dir)
